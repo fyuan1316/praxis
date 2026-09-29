@@ -35,6 +35,9 @@ bytes = { workspace = true }
 futures = { workspace = true }
 h2 = { workspace = true }
 http = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
 # The policy example tests mint HS256 JWTs through the system OpenSSL
 # (examples/jwt.rs) rather than jsonwebtoken, whose aws-lc-rs would otherwise
 # sit in the FIPS test build's graph.
