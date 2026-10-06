@@ -3,12 +3,18 @@
 
 //! Proxy startup and configuration test utilities for integration tests.
 
-use std::{collections::HashMap, fmt, path::PathBuf, sync::Arc, thread::JoinHandle, time::Duration};
+use std::{
+    fmt,
+    path::PathBuf,
+    sync::Arc,
+    thread::JoinHandle,
+    time::{Duration, Instant},
+};
 
 use arc_swap::ArcSwap;
 use pingora_core::server::{RunArgs, ShutdownSignal, ShutdownSignalWatch};
 use praxis_core::{
-    config::{Config, Listener, ProtocolKind},
+    config::{Config, ExpandedFilterChains, Listener, ProtocolKind},
     health::{HealthRegistry, build_health_registry},
     server::RuntimeOptions,
 };
@@ -31,14 +37,26 @@ use tokio_util::sync::CancellationToken;
 /// [`ProxyGuard`]: ProxyGuard
 const JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Time to wait after writing a config file for the watcher to debounce
-/// and apply the reload. The watcher debounces for 500ms; for the small
-/// configs these tests reload, rebuilding and swapping the pipeline then
-/// takes only milliseconds, so double the debounce window is a safe
-/// budget. A config whose filters do I/O at load (for example a `policy`
-/// filter fetching JWKS) can take much longer; such a test must wait on
-/// its own readiness signal instead of relying on this constant.
+/// How long [`ReloadableProxyGuard::reload`] sleeps after writing a config.
+///
+/// This covers the watcher's 500ms debounce plus a quick rebuild on an idle
+/// machine, and nothing more. On a loaded CI host the reload can land well
+/// after it, so it only suits tests that expect the edit to be rejected. A test
+/// that expects the new config to take effect waits for it with
+/// [`ReloadableProxyGuard::reload_until`] instead.
 const RELOAD_SETTLE: Duration = Duration::from_millis(1000);
+
+/// How long [`ReloadableProxyGuard::reload_until`] waits for a new config to
+/// show up before handing the last observation back to the caller.
+///
+/// Generous on purpose: past the 500ms debounce, how long the rebuild takes
+/// depends on how busy the host is, and a failed first attempt backs off for a
+/// full second before it retries. Matches the budget the hot-reload tests poll
+/// with.
+const RELOAD_DEADLINE: Duration = Duration::from_secs(15);
+
+/// Pause between observations while waiting for a reload to take effect.
+const RELOAD_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Worker threads per proxy spawned by the test harness.
 ///
@@ -125,22 +143,21 @@ fn resolve_praxis_bin_path() -> PathBuf {
 /// [`FilterPipeline`]: praxis_filter::FilterPipeline
 /// [`FilterEntry`]: praxis_core::config::FilterEntry
 fn resolve_listener_pipeline(config: &Config, listener: &Listener, registry: &FilterRegistry) -> Arc<FilterPipeline> {
-    let chains: HashMap<&str, &[_]> = config
-        .filter_chains
-        .iter()
-        .map(|c| (c.name.as_str(), c.filters.as_slice()))
-        .collect();
-
-    let mut entries = Vec::new();
-    for chain_name in &listener.filter_chains {
-        let filters = chains
-            .get(chain_name.as_str())
-            .unwrap_or_else(|| panic!("unknown filter chain: {chain_name}"));
-        entries.extend_from_slice(filters);
-    }
+    let expanded_chains = ExpandedFilterChains::new(&config.filter_chains);
+    let chains = expanded_chains.as_slices();
+    let mut entries = expanded_chains
+        .for_listener(listener)
+        .unwrap_or_else(|err| panic!("{err}"));
 
     let mut pipeline =
         FilterPipeline::build_with_chains(&mut entries, registry, &chains, &config.insecure_options).unwrap();
+    configure_test_pipeline(&mut pipeline, config);
+    Arc::new(pipeline)
+}
+
+/// Apply the config's runtime settings to a freshly built pipeline, mirroring
+/// the server's `configure_pipeline`.
+fn configure_test_pipeline(pipeline: &mut FilterPipeline, config: &Config) {
     pipeline
         .apply_body_limits(
             config.body_limits.max_request_bytes,
@@ -152,10 +169,9 @@ fn resolve_listener_pipeline(config: &Config, listener: &Listener, registry: &Fi
     pipeline.set_route_templates(Arc::new(praxis_core::config::RouteTemplates::compile(
         &config.metrics.route_templates,
     )));
-    // Mirrors `configure_pipeline` in the server: without it a hostname
-    // upstream is refused at connection time even when the config opts in.
+    // Without it a hostname upstream is refused at connection time even when
+    // the config opts in.
     pipeline.set_allow_private_upstreams(config.insecure_options.allow_private_upstreams);
-    Arc::new(pipeline)
 }
 
 /// Build the filter pipeline from the config using the
@@ -225,7 +241,7 @@ impl Drop for ProxyGuard {
     fn drop(&mut self) {
         self.notify.notify_one();
         if let Some(handle) = self.handle.take() {
-            let start = std::time::Instant::now();
+            let start = Instant::now();
             while !handle.is_finished() {
                 if start.elapsed() >= JOIN_TIMEOUT {
                     tracing::warn!(
@@ -418,7 +434,7 @@ fn build_full_server_with_registry(config: &Config, registry: &FilterRegistry) -
                 pipelines: Some((Arc::clone(&pipelines), Arc::clone(&listener_meta))),
                 log_level: None,
                 stats: Some(praxis_protocol::http::pingora::health::StatsAdminState {
-                    started_at: std::time::Instant::now(),
+                    started_at: Instant::now(),
                     version: praxis::process_version_info(),
                     listener_meta,
                     cluster_meta,
@@ -553,10 +569,42 @@ impl ReloadableProxyGuard {
         std::fs::write(&self.config_path, yaml).expect("failed to write config file");
     }
 
-    /// Rewrite config and wait for the debounce window.
+    /// Rewrite config and sleep for a fixed settle window.
+    ///
+    /// Nothing checks that the reload happened, so this is for tests that
+    /// expect the edit to be rejected and the old pipeline to keep serving. To
+    /// assert that a new config took effect, use [`reload_until`], which waits
+    /// for the change instead of guessing how long it takes.
+    ///
+    /// [`reload_until`]: ReloadableProxyGuard::reload_until
     pub fn reload(&self, yaml: &str) {
         self.write_config(yaml);
         std::thread::sleep(RELOAD_SETTLE);
+    }
+
+    /// Rewrite config, then call `observe` until `applied` accepts what it
+    /// returns, and hand that observation back.
+    ///
+    /// The watcher applies an edit asynchronously, and on a busy host that can
+    /// take longer than any fixed sleep. `observe` should probe what the test is
+    /// about to assert on, and `applied` should recognize the new config's
+    /// output. If the change never shows up, the last observation comes back
+    /// after the deadline anyway, so the caller's assertion fails on what the
+    /// proxy actually served.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the file cannot be written.
+    pub fn reload_until<T, O: FnMut() -> T, A: Fn(&T) -> bool>(&self, yaml: &str, mut observe: O, applied: A) -> T {
+        self.write_config(yaml);
+        let deadline = Instant::now() + RELOAD_DEADLINE;
+        loop {
+            let observation = observe();
+            if applied(&observation) || Instant::now() >= deadline {
+                return observation;
+            }
+            std::thread::sleep(RELOAD_POLL_INTERVAL);
+        }
     }
 }
 
@@ -564,15 +612,15 @@ impl ReloadableProxyGuard {
 /// to a temp file and passing the path to the server.
 ///
 /// Returns a guard with the listen address and config path.
-/// Use [`ReloadableProxyGuard::reload`] to mutate the config
-/// and wait for the change to take effect.
+/// Use [`ReloadableProxyGuard::reload_until`] to change the
+/// config and wait until the proxy serves the change.
 ///
 /// # Panics
 ///
 /// Panics if the config cannot be parsed or the server fails
 /// to start.
 ///
-/// [`ReloadableProxyGuard::reload`]: ReloadableProxyGuard::reload
+/// [`ReloadableProxyGuard::reload_until`]: ReloadableProxyGuard::reload_until
 pub fn start_reloadable_proxy(yaml: &str) -> ReloadableProxyGuard {
     let mut config = Config::from_yaml(yaml).expect("test config should parse");
     // Cap worker threads for the reloadable path: run_server builds the

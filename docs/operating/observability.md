@@ -181,8 +181,9 @@ request is admitted and decremented when it finishes.
 | `listener` | Listener name from config |
 
 Requests rejected by overload protection (memory
-pressure, global or per-listener connection limits)
-are never admitted and do not appear here. The
+pressure, file descriptor pressure, global or
+per-listener connection limits) are never admitted and
+do not appear here. The
 decrement is tied to the request context's lifetime,
 so it also fires when a client aborts mid-body or an
 HTTP/2 stream is reset.
@@ -227,6 +228,52 @@ here. Connect failures do appear under
 counter stands on its own as an error denominator
 rather than needing the connect-failure counter added
 in.
+
+### Overload and Process Metrics
+
+#### `praxis_overload_rejects_total` (counter)
+
+Requests (HTTP) and connections (TCP) rejected by
+overload protection before any filter runs. HTTP
+rejections answer `503` with `Retry-After`; TCP
+rejections close the connection.
+
+| Label | Values |
+| -------- | ---------------------------------------- |
+| `reason` | `memory`, `file_descriptors`, `global_connections`, `listener_connections` |
+
+`file_descriptors` counts requests shed because open
+descriptors neared the process limit (see
+`runtime.shed_on_fd_pressure`). A steady rate means
+the limit is too small for the traffic.
+
+#### `praxis_process_open_fds` / `praxis_process_max_fds` (gauges)
+
+File descriptors the process holds open, and its soft
+open file limit (`RLIMIT_NOFILE`). Sampled in the
+background on Linux; absent elsewhere. Alert well
+before the ratio reaches the shedding threshold (the
+limit less 5%, or less 64 on small limits). The admin
+`/api/stats` view reports the same numbers under
+`file_descriptors`.
+
+### Rate Limit Metrics
+
+#### `praxis_rate_limit_limited_total` (counter)
+
+Requests that exceeded a `rate_limit` filter's
+bucket, summed over every `rate_limit` entry in the
+process.
+
+| Label | Values |
+| -------- | --------------- |
+| `shadow` | `true`, `false` |
+
+`shadow="false"` counts requests rejected with
+`429`. `shadow="true"` counts requests that a
+`shadow: true` limit would have rejected but let
+through: the number to watch when tuning a new
+limit before enforcing it.
 
 ### Upstream Metrics
 
@@ -553,8 +600,11 @@ histogram_quantile(0.95,
 ## Access Logging
 
 Praxis uses the `access_log` filter for structured
-request/response logging. Logs are emitted via the
-`tracing` framework, not written to a separate file.
+request/response logging. By default each record is
+emitted through the `tracing` subscriber, alongside
+process logs. A `sink` can instead write records
+straight to stdout or a dedicated file — see
+[Output Sinks](#output-sinks).
 
 ### Enabling Access Logs
 
@@ -640,6 +690,40 @@ PRAXIS_LOG_FORMAT=json cargo run -p praxis-proxy
 The default format is human-readable text. Both
 formats include the same structured fields.
 
+### Output Sinks
+
+By default access records flow through the `tracing`
+subscriber, so they share formatting, level filtering,
+and destination with process logs. A `sink` detaches
+them onto a dedicated writer that always emits NDJSON
+(one JSON object per line), bypassing the subscriber and
+its INFO-level gate:
+
+```yaml
+- filter: access_log
+  sink:
+    type: file                         # `stdout` or `file`
+    path: /var/log/praxis/access.log   # required for `file`
+```
+
+Sinks are **best effort**. Each sink hands records to a
+background writer through a bounded queue (8192 records);
+once the queue is full — a slow or stalled disk, a burst
+faster than the writer drains — further records are
+dropped rather than blocking request handling, and a
+warning reports the running drop count. Use a sink for
+operational visibility, not as the system of record for
+audit-grade logging.
+
+`{type: stdout}` writes to the same stdout as the
+process logs, so the two interleave unless you send
+process logs elsewhere with `runtime.logging.output`
+(`stderr` or `file`) — see
+[Process Logging Destination](#process-logging-destination).
+`{type: file}` opens the path in append mode (no
+rotation); secure its permissions and rotate it
+externally.
+
 Warnings raised while the config is loaded and
 validated (active `insecure_options`, degraded upstream
 TLS, likely filter config typos) are emitted before the
@@ -696,6 +780,9 @@ runtime:
 Defaults keep today's behavior: non-blocking stdout,
 text or JSON via `PRAXIS_LOG_FORMAT`, lossy overflow
 when the buffer is full.
+
+`buffer_size` sizes the non-blocking queue, so it is
+rejected when `non_blocking` is `false`.
 
 Praxis does not rotate log files. With `output: file`
 the log grows in place at `file_path`; rotation and

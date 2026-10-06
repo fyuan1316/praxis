@@ -5,14 +5,12 @@
 //!
 //! [`Upstream`]: praxis_core::connectivity::Upstream
 
-use std::{
-    net::SocketAddr,
-    sync::{
-        Arc, Condvar, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Instant,
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::{
+    Condvar, Mutex,
+    atomic::{AtomicBool, Ordering},
 };
+use std::{net::SocketAddr, sync::Arc, time::Instant};
 
 use pingora_core::{
     Result,
@@ -28,12 +26,16 @@ use super::super::context::PingoraRequestCtx;
 // -----------------------------------------------------------------------------
 
 /// Test-only: when armed, upstream connect retries park until released.
+#[cfg(any(test, feature = "test-support"))]
 static UPSTREAM_RETRY_GATE_ARMED: AtomicBool = AtomicBool::new(false);
 /// Park mutex for the test retry gate.
+#[cfg(any(test, feature = "test-support"))]
 static UPSTREAM_RETRY_GATE_PARK: Mutex<()> = Mutex::new(());
 /// Condvar for the test retry gate.
+#[cfg(any(test, feature = "test-support"))]
 static UPSTREAM_RETRY_GATE_CV: Condvar = Condvar::new();
 /// Serializes tests that arm the retry gate.
+#[cfg(any(test, feature = "test-support"))]
 static UPSTREAM_RETRY_GATE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 /// Serializes integration tests that arm the upstream retry gate.
@@ -41,6 +43,7 @@ static UPSTREAM_RETRY_GATE_TEST_LOCK: Mutex<()> = Mutex::new(());
 /// # Panics
 ///
 /// Panics if the lock mutex is poisoned.
+#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub fn lock_upstream_retry_gate_tests() -> std::sync::MutexGuard<'static, ()> {
     #[expect(clippy::expect_used, reason = "poisoned mutex is unrecoverable")]
@@ -52,9 +55,11 @@ pub fn lock_upstream_retry_gate_tests() -> std::sync::MutexGuard<'static, ()> {
 /// Releases an armed upstream-retry wait (see [`arm_upstream_retry_gate`]).
 ///
 /// The gate clears automatically on drop.
+#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub struct UpstreamRetryGateRelease;
 
+#[cfg(any(test, feature = "test-support"))]
 impl Drop for UpstreamRetryGateRelease {
     fn drop(&mut self) {
         clear_upstream_retry_gate_wait();
@@ -62,6 +67,7 @@ impl Drop for UpstreamRetryGateRelease {
 }
 
 /// Clear the armed flag and wake parked retries.
+#[cfg(any(test, feature = "test-support"))]
 fn clear_upstream_retry_gate_wait() {
     UPSTREAM_RETRY_GATE_ARMED.store(false, Ordering::SeqCst);
     UPSTREAM_RETRY_GATE_CV.notify_all();
@@ -72,11 +78,27 @@ fn clear_upstream_retry_gate_wait() {
 /// # Panics
 ///
 /// Panics if the test-lock mutex is poisoned.
+#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub fn arm_upstream_retry_gate() -> (std::sync::MutexGuard<'static, ()>, UpstreamRetryGateRelease) {
     let guard = lock_upstream_retry_gate_tests();
     UPSTREAM_RETRY_GATE_ARMED.store(true, Ordering::SeqCst);
     (guard, UpstreamRetryGateRelease)
+}
+
+/// Park a retry attempt while the test gate is armed.
+#[cfg(any(test, feature = "test-support"))]
+fn wait_for_upstream_retry_gate(retries: u32) {
+    if retries > 0 && UPSTREAM_RETRY_GATE_ARMED.load(Ordering::SeqCst) {
+        #[expect(clippy::expect_used, reason = "poisoned mutex/condvar is unrecoverable")]
+        {
+            let mut park = UPSTREAM_RETRY_GATE_PARK.lock().expect("upstream retry gate park lock");
+            while UPSTREAM_RETRY_GATE_ARMED.load(Ordering::SeqCst) {
+                park = UPSTREAM_RETRY_GATE_CV.wait(park).expect("upstream retry gate wait");
+            }
+            drop(park);
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -91,16 +113,8 @@ pub fn arm_upstream_retry_gate() -> (std::sync::MutexGuard<'static, ()>, Upstrea
 /// alternate host (after applying any pending backoff).
 #[expect(clippy::too_many_lines, reason = "retry orchestration reads clearer as one function")]
 pub(super) async fn execute(ctx: &mut PingoraRequestCtx) -> Result<Box<HttpPeer>> {
-    if ctx.retries > 0 && UPSTREAM_RETRY_GATE_ARMED.load(Ordering::SeqCst) {
-        #[expect(clippy::expect_used, reason = "poisoned mutex/condvar is unrecoverable")]
-        {
-            let mut park = UPSTREAM_RETRY_GATE_PARK.lock().expect("upstream retry gate park lock");
-            while UPSTREAM_RETRY_GATE_ARMED.load(Ordering::SeqCst) {
-                park = UPSTREAM_RETRY_GATE_CV.wait(park).expect("upstream retry gate wait");
-            }
-            drop(park);
-        }
-    }
+    #[cfg(any(test, feature = "test-support"))]
+    wait_for_upstream_retry_gate(ctx.retries);
 
     if let Some(backoff) = ctx.pending_backoff.take()
         && !backoff.is_zero()
@@ -111,6 +125,7 @@ pub(super) async fn execute(ctx: &mut PingoraRequestCtx) -> Result<Box<HttpPeer>
 
     if ctx.reselect_on_retry {
         ctx.reselect_on_retry = false;
+        let prior_sni = ctx.prior_attempt_sni.take();
         if let Some(reselector) = ctx.endpoint_reselector.clone() {
             let health = ctx
                 .pinned_pipeline
@@ -127,7 +142,7 @@ pub(super) async fn execute(ctx: &mut PingoraRequestCtx) -> Result<Box<HttpPeer>
                 }
                 ctx.selected_endpoint_index = Some(reselected_endpoint_index(health, &addr));
                 let mut upstream = reselector.build_upstream(addr);
-                carry_forward_sni(&mut upstream, ctx.upstream_for_retry.as_ref());
+                carry_forward_sni(&mut upstream, prior_sni);
                 apply_per_try_timeout(ctx, &mut upstream);
                 ctx.upstream_for_retry = Some(upstream);
             } else {
@@ -219,16 +234,15 @@ fn shorter(configured: Option<std::time::Duration>, remaining: std::time::Durati
 
 /// Keep the SNI the previous attempt presented when a reselected endpoint's
 /// cluster TLS names none. The first selection fills a missing SNI from the
-/// request `Host`; without this the retry would derive one from the new
-/// endpoint address and an SNI-routed upstream would see a different name.
-fn carry_forward_sni(upstream: &mut Upstream, previous: Option<&Upstream>) {
-    let Some(sni) = previous.and_then(|p| p.tls.as_ref()).and_then(|t| t.sni()) else {
-        return;
-    };
-    if let Some(tls) = upstream.tls.as_mut()
+/// cluster authority or the request `Host`; without this the retry would
+/// derive one from the new endpoint address and an SNI-routed upstream would
+/// see a different name.
+fn carry_forward_sni(upstream: &mut Upstream, prior_sni: Option<Arc<str>>) {
+    if let Some(sni) = prior_sni
+        && let Some(tls) = upstream.tls.as_mut()
         && tls.sni().is_none()
     {
-        tls.set_sni(Arc::<str>::from(sni));
+        tls.set_sni(sni);
     }
 }
 
@@ -253,8 +267,10 @@ fn apply_per_try_timeout(ctx: &PingoraRequestCtx, upstream: &mut Upstream) {
 /// TLS certificates are already pre-parsed in the [`CachedClusterTls`]
 /// attached to the upstream, so this performs no filesystem I/O.
 ///
-/// When `sni` is `None`, derives it from the upstream address hostname
-/// (unless it is an IP address).
+/// When `sni` is `None`, derives it from the upstream address: a hostname
+/// endpoint is verified by name, an IP endpoint by its certificate's IP SAN.
+/// A TLS upstream that ends up with no name at all is refused with a
+/// connect error instead of being dialed.
 ///
 /// `allow_private` mirrors `insecure_options.allow_private_upstreams`:
 /// when it is `false`, an upstream hostname that resolves into a private
@@ -263,20 +279,16 @@ fn apply_per_try_timeout(ctx: &PingoraRequestCtx, upstream: &mut Upstream) {
 /// [`HttpPeer`]: pingora_core::upstreams::peer::HttpPeer
 /// [`CachedClusterTls`]: praxis_tls::CachedClusterTls
 async fn build_peer(upstream: &Upstream, allow_private: bool) -> Result<Box<HttpPeer>> {
-    let addr: SocketAddr = resolve_address(&upstream.address, allow_private).await?;
+    let addr: SocketAddr = resolve_upstream(upstream, allow_private).await?;
 
     let tls_enabled = upstream.tls.is_some();
     let sni = upstream
         .tls
         .as_ref()
-        .and_then(|t| t.sni().map(str::to_owned))
-        .unwrap_or_else(|| {
-            if tls_enabled {
-                peer_utils::derive_sni(&upstream.address)
-            } else {
-                String::new()
-            }
-        });
+        .map(|tls| peer_utils::tls_server_name(tls, &upstream.address))
+        .transpose()
+        .map_err(|error| pingora_core::Error::explain(pingora_core::ErrorType::ConnectError, error.to_string()))?
+        .unwrap_or_default();
 
     let mut peer = HttpPeer::new(addr, tls_enabled, sni);
     // Pingora 0.9.0 sanitizes the upstream request (removing headers a client
@@ -311,21 +323,22 @@ async fn build_peer(upstream: &Upstream, allow_private: bool) -> Result<Box<Http
 /// connectivity issues in dual-stack environments.
 ///
 /// A resolved (as opposed to literal) address in a private or reserved
-/// range is rejected unless `allow_private` is set, which is the runtime
-/// half of the DNS-rebinding / SSRF control. The check runs per request,
+/// range is rejected unless `allow_private` is set or the host is trusted, the
+/// runtime half of the DNS-rebinding / SSRF control. The check runs per request,
 /// so a cached answer is re-validated rather than trusted for its TTL.
 ///
 /// [`SocketAddr`]: std::net::SocketAddr
 /// [`spawn_blocking`]: tokio::task::spawn_blocking
-async fn resolve_address(address: &str, allow_private: bool) -> Result<SocketAddr> {
-    peer_utils::resolve_address_checked(address, allow_private)
+async fn resolve_upstream(upstream: &Upstream, allow_private: bool) -> Result<SocketAddr> {
+    peer_utils::resolve_upstream_checked(upstream, allow_private)
         .await
         .map_err(|error| {
             // A refused private/reserved address is an upstream reachability
             // verdict, not a proxy fault, so it surfaces as 502 rather than
             // the 500 every other resolution failure maps to.
             let etype = match error {
-                peer_utils::AddressResolutionError::PrivateAddress { .. } => pingora_core::ErrorType::ConnectError,
+                peer_utils::AddressResolutionError::PrivateAddress { .. }
+                | peer_utils::AddressResolutionError::UntrustedRange { .. } => pingora_core::ErrorType::ConnectError,
                 _ => pingora_core::ErrorType::InternalError,
             };
             pingora_core::Error::explain(etype, error.to_string())
@@ -354,15 +367,14 @@ mod tests {
 
     use super::*;
 
+    /// The downstream `Host` every load-balanced test request carries.
+    const CLIENT_HOST: &str = "client.example.com";
+
     #[test]
     fn reselected_upstream_keeps_the_previous_attempts_sni() {
-        let mut previous = tls_upstream("10.0.0.1:443", None);
-        if let Some(tls) = previous.tls.as_mut() {
-            tls.set_sni("api.example.com");
-        }
         let mut reselected = tls_upstream("10.0.0.2:443", None);
 
-        carry_forward_sni(&mut reselected, Some(&previous));
+        carry_forward_sni(&mut reselected, Some(Arc::from("api.example.com")));
 
         assert_eq!(
             reselected.tls.as_ref().and_then(|t| t.sni()),
@@ -373,15 +385,99 @@ mod tests {
 
     #[test]
     fn reselected_upstream_keeps_an_explicit_cluster_sni() {
-        let previous = tls_upstream("10.0.0.1:443", Some("from-host.example.com"));
         let mut reselected = tls_upstream("10.0.0.2:443", Some("configured.example.com"));
 
-        carry_forward_sni(&mut reselected, Some(&previous));
+        carry_forward_sni(&mut reselected, Some(Arc::from("from-host.example.com")));
 
         assert_eq!(
             reselected.tls.as_ref().and_then(|t| t.sni()),
             Some("configured.example.com"),
             "an SNI set in the cluster config must win over the carried one"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_failure_retry_keeps_the_host_derived_sni() {
+        let [first, retry] = sni_across_reselection(&["tls: {}"], fail_connect).await;
+
+        assert_eq!(first, CLIENT_HOST, "the first attempt should take its SNI from Host");
+        assert_eq!(
+            retry, CLIENT_HOST,
+            "a retry to a reselected IP endpoint must keep the Host-derived SNI, not drop it"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_retry_keeps_the_host_derived_sni() {
+        let [first, retry] = sni_across_reselection(&["tls: {}"], fail_with_503).await;
+
+        assert_eq!(first, CLIENT_HOST, "the first attempt should take its SNI from Host");
+        assert_eq!(
+            retry, CLIENT_HOST,
+            "a 5xx retry to a reselected IP endpoint must keep the Host-derived SNI"
+        );
+    }
+
+    #[tokio::test]
+    async fn reselected_retry_keeps_the_fixed_authority_as_sni() {
+        let settings = ["http: { authority: \"api.internal.example:8443\" }", "tls: {}"];
+        let [first, retry] = sni_across_reselection(&settings, fail_connect).await;
+
+        assert_eq!(
+            first, "api.internal.example",
+            "the fixed authority should win over Host for the first attempt's SNI"
+        );
+        assert_eq!(
+            retry, "api.internal.example",
+            "a retry must keep the fixed authority's name, not fall back to the endpoint address"
+        );
+    }
+
+    #[tokio::test]
+    async fn reselected_retry_keeps_an_explicit_cluster_sni() {
+        let [first, retry] = sni_across_reselection(&["tls: { sni: configured.example.com }"], fail_connect).await;
+
+        assert_eq!(
+            first, "configured.example.com",
+            "tls.sni should win on the first attempt"
+        );
+        assert_eq!(retry, "configured.example.com", "tls.sni should win on the retry too");
+    }
+
+    #[tokio::test]
+    async fn reselected_peer_presents_its_own_sni_when_authority_follows_the_endpoint() {
+        for host in ["alpha.reselect-sni.test", "beta.reselect-sni.test"] {
+            peer_utils::seed_dns(host, &[std::net::IpAddr::from([127, 0, 0, 1])]);
+        }
+        let mut ctx = load_balanced_ctx(
+            r#"["alpha.reselect-sni.test:443", "beta.reselect-sni.test:443"]"#,
+            &["http: { authority: { from: endpoint } }", "tls: {}"],
+        )
+        .await;
+
+        let first = execute(&mut ctx).await.expect("first attempt should build a peer");
+        let first_address = Arc::clone(&ctx.upstream_for_retry.as_ref().unwrap().address);
+        assert_eq!(
+            first.sni,
+            peer_utils::derive_sni(&first_address),
+            "the first attempt should present its endpoint's name, not the downstream Host"
+        );
+
+        fail_connect(&mut ctx);
+        assert!(
+            ctx.prior_attempt_sni.is_none(),
+            "an endpoint-derived SNI is not resolved up front, so there is nothing to carry"
+        );
+        let retry = execute(&mut ctx).await.expect("the retry should build a peer");
+        let retry_address = Arc::clone(&ctx.upstream_for_retry.as_ref().unwrap().address);
+        assert_ne!(
+            retry_address, first_address,
+            "the retry should reselect the other endpoint"
+        );
+        assert_eq!(
+            retry.sni,
+            peer_utils::derive_sni(&retry_address),
+            "a reselected endpoint must present its own name, not carry the first attempt's SNI forward"
         );
     }
 
@@ -419,10 +515,31 @@ mod tests {
         );
     }
 
-    #[test]
-    fn sni_not_set_with_ip_address_leaves_sni_empty() {
-        let sni = peer_utils::derive_sni("127.0.0.1:8443");
-        assert_eq!(sni, "", "SNI should be empty for IP address");
+    #[tokio::test]
+    async fn build_peer_names_an_ip_endpoint_by_its_ip() {
+        let upstream = tls_upstream("127.0.0.1:8443", None);
+        let peer = build_peer(&upstream, false).await.expect("should build TLS peer");
+        assert_eq!(
+            peer.sni, "127.0.0.1",
+            "an IP endpoint without tls.sni should be verified against its IP SAN"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_peer_refuses_a_tls_peer_with_no_server_name() {
+        let upstream = tls_upstream("127.0.0.1:8443", Some(""));
+        let err = build_peer(&upstream, false)
+            .await
+            .expect_err("a TLS peer with an empty name must not be built");
+        assert_eq!(
+            err.etype(),
+            &pingora_core::ErrorType::ConnectError,
+            "the refusal should surface as a connect error (502)"
+        );
+        assert!(
+            err.to_string().contains("no server name"),
+            "the error should say why the peer was refused: {err}"
+        );
     }
 
     #[tokio::test]
@@ -490,7 +607,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_address_parses_socket_addr() {
-        let addr = resolve_address("127.0.0.1:8080", false)
+        let addr = resolve_upstream(&make_upstream("127.0.0.1:8080"), false)
             .await
             .expect("socket addr should parse");
         assert_eq!(addr.port(), 8080, "port should match");
@@ -502,7 +619,7 @@ mod tests {
             eprintln!("skipping: localhost did not resolve in this environment");
             return;
         }
-        let addr = resolve_address("localhost:8080", true)
+        let addr = resolve_upstream(&make_upstream("localhost:8080"), true)
             .await
             .expect("localhost should resolve");
         assert_eq!(addr.port(), 8080, "port should match");
@@ -511,7 +628,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_address_fails_for_no_port() {
         assert!(
-            resolve_address("127.0.0.1", false).await.is_err(),
+            resolve_upstream(&make_upstream("127.0.0.1"), false).await.is_err(),
             "address without port should return error"
         );
     }
@@ -788,6 +905,97 @@ mod tests {
     // -------------------------------------------------------------------------
     // Test Utilities
     // -------------------------------------------------------------------------
+
+    /// Run a request through a TLS cluster on two IP endpoints, fail the
+    /// first attempt with `fail`, and return the SNI the first attempt and
+    /// the reselected retry presented.
+    async fn sni_across_reselection(settings: &[&str], fail: fn(&mut PingoraRequestCtx)) -> [String; 2] {
+        let mut ctx = load_balanced_ctx(r#"["10.0.0.1:443", "10.0.0.2:443"]"#, settings).await;
+
+        let first_peer = execute(&mut ctx).await.expect("first attempt should build a peer");
+        let first_address = Arc::clone(&ctx.upstream_for_retry.as_ref().unwrap().address);
+
+        fail(&mut ctx);
+        assert!(
+            ctx.upstream_for_retry.is_none(),
+            "a configured retry policy should clear the failed upstream to force reselection"
+        );
+        let retry_peer = execute(&mut ctx).await.expect("the retry should build a peer");
+        let retry_address = Arc::clone(&ctx.upstream_for_retry.as_ref().unwrap().address);
+        assert_ne!(
+            retry_address, first_address,
+            "the retry should reselect the other endpoint"
+        );
+        assert!(
+            ctx.prior_attempt_sni.is_none(),
+            "the carried SNI should be consumed by the retry it was kept for"
+        );
+
+        [first_peer.sni.clone(), retry_peer.sni.clone()]
+    }
+
+    /// Fail the current attempt with a connect error and check that the
+    /// retry policy chose to retry.
+    fn fail_connect(ctx: &mut PingoraRequestCtx) {
+        let error = pingora_core::Error::explain(pingora_core::ErrorType::ConnectError, "test connect failure");
+        let error = super::super::retry_util::handle_connect_failure(ctx, error);
+        assert!(error.retry(), "a connect failure should be retried");
+    }
+
+    /// Fail the current attempt with a 503 response and check that the retry
+    /// policy chose to retry.
+    fn fail_with_503(ctx: &mut PingoraRequestCtx) {
+        assert!(
+            super::super::retry_util::maybe_retry_response(ctx, 503).is_some_and(|error| error.retry()),
+            "a 503 should be retried"
+        );
+    }
+
+    /// Run a `GET` with `Host: client.example.com` through a load balancer
+    /// for one cluster on `endpoints`, with a configured connect-failure and
+    /// 5xx retry policy plus the extra cluster `settings` lines, and return
+    /// the request context ready for its first `execute`.
+    async fn load_balanced_ctx(endpoints: &str, settings: &[&str]) -> Box<PingoraRequestCtx> {
+        let settings: String = settings.iter().map(|line| format!("    {line}\n")).collect();
+        let config: serde_yaml::Value = serde_yaml::from_str(&format!(
+            "
+clusters:
+  - name: backend
+    endpoints: {endpoints}
+    retry_policy:
+      max_retries: 2
+      retriable_conditions: [connect_failure, status_5xx]
+      backoff: {{ base_interval_ms: 1, max_interval_ms: 1 }}
+{settings}"
+        ))
+        .unwrap();
+        let lb = praxis_filter::LoadBalancerFilter::from_config(&config).unwrap();
+        let mut pipeline =
+            praxis_filter::FilterPipeline::build(&mut [], &praxis_filter::FilterRegistry::with_builtins()).unwrap();
+        pipeline.set_allow_private_upstreams(true);
+        let pipeline = Arc::new(pipeline);
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::HOST, http::HeaderValue::from_static(CLIENT_HOST));
+        let request = praxis_filter::Request {
+            method: http::Method::GET,
+            uri: http::Uri::from_static("/"),
+            headers,
+        };
+
+        let mut ctx = Box::new(PingoraRequestCtx::default());
+        ctx.cluster = Some(Arc::from("backend"));
+        ctx.request_is_idempotent = true;
+        let mut filter_ctx = ctx.build_filter_context(&pipeline, &request, None);
+        drop(lb.on_request(&mut filter_ctx).await.unwrap());
+        ctx.cluster = filter_ctx.cluster.take();
+        ctx.upstream = filter_ctx.upstream.take();
+        ctx.endpoint_reselector = filter_ctx.endpoint_reselector.take();
+        ctx.retry_policy = filter_ctx.retry_policy.take();
+        ctx.attempted_endpoints = std::mem::take(&mut filter_ctx.attempted_endpoints);
+        drop(filter_ctx);
+        ctx.pinned_pipeline = Some(pipeline);
+        ctx
+    }
 
     /// Check whether `localhost` DNS resolution is available in this environment.
     fn localhost_resolution_available() -> bool {

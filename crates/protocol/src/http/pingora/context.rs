@@ -181,6 +181,10 @@ pub struct PingoraRequestCtx {
     /// RAII guard that decrements `praxis_http_active_requests` on drop.
     pub(crate) _active_request: Option<crate::http::pingora::metrics::ActiveRequestGuard>,
 
+    /// Claim on descriptors this request may still open, settled once its
+    /// upstream connects and released on drop.
+    pub(crate) fd_admission: Option<praxis_core::fd::Admission<'static>>,
+
     /// When the current upstream connect attempt started.
     pub upstream_connect_start: Option<Instant>,
 
@@ -349,6 +353,11 @@ pub struct PingoraRequestCtx {
 
     /// Pending backoff delay to apply before the next `upstream_peer` call.
     pub pending_backoff: Option<std::time::Duration>,
+
+    /// SNI the failed attempt presented, kept when a retry clears
+    /// `upstream_for_retry` to reselect so the next attempt presents the
+    /// same name instead of deriving one from the new endpoint.
+    pub prior_attempt_sni: Option<Arc<str>>,
 
     /// Whether the next upstream attempt should re-select (alternate host).
     pub reselect_on_retry: bool,
@@ -609,6 +618,7 @@ impl Default for PingoraRequestCtx {
             metrics_route: None,
             error_type: None,
             _active_request: None,
+            fd_admission: None,
             upstream_connect_start: None,
             pre_read_body: None,
             retained_pre_read_body: None,
@@ -644,6 +654,7 @@ impl Default for PingoraRequestCtx {
             cluster_retry_state_released: false,
             endpoint_reselector: None,
             pending_backoff: None,
+            prior_attempt_sni: None,
             reselect_on_retry: false,
             upstream: None,
             upstream_for_retry: None,

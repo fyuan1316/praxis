@@ -22,12 +22,14 @@ mod branch_chain;
 mod chain_ref;
 mod cluster;
 mod condition;
+mod expanded_chains;
 mod filters;
 mod insecure_options;
 mod listener;
 mod logging;
 mod metrics;
 mod parse;
+mod redaction;
 mod route;
 pub mod runtime;
 mod telemetry;
@@ -36,18 +38,20 @@ mod validate;
 pub use admin::AdminConfig;
 pub use body_limits::{ABSOLUTE_MAX_BODY_BYTES, BodyLimitsConfig, DEFAULT_MAX_BODY_BYTES};
 pub use bootstrap::{ConfigFile, DEFAULT_CONFIG, load_config};
-pub use branch_chain::{BranchChainConfig, BranchCondition};
+pub use branch_chain::{BranchChainConfig, BranchCondition, ResultMatch};
 pub use chain_ref::ChainRef;
 pub use cluster::{
-    BackoffConfig, BudgetPercent, Cluster, ClusterHttpOptions, ConsistentHashOpts, DEFAULT_MAX_RETRIES,
-    DEFAULT_RETRY_BODY_LIMIT_BYTES, Endpoint, HashFunction, HealthCheckConfig, HealthCheckType, HttpStatusCode,
-    LoadBalancerStrategy, MAX_EFFECTIVE_RETRIES, MAX_RETRY_BODY_LIMIT_BYTES, MaglevOpts, ParameterisedStrategy,
-    PriorityOpts, RetriableCondition, RetryBodyLimit, RetryBudgetConfig, RetryPolicy, RingHashOpts, SimpleStrategy,
-    SubsetFallbackPolicy, SubsetOpts, UpstreamHttpVersion, ZoneAwareOpts,
+    AuthoritySource, BackoffConfig, BudgetPercent, Cluster, ClusterHttpOptions, ConsistentHashOpts,
+    DEFAULT_MAX_RETRIES, DEFAULT_RETRY_BODY_LIMIT_BYTES, Endpoint, HashFunction, HealthCheckConfig, HealthCheckType,
+    HttpStatusCode, LoadBalancerStrategy, MAX_EFFECTIVE_RETRIES, MAX_RETRY_BODY_LIMIT_BYTES, MaglevOpts,
+    ParameterisedStrategy, PriorityOpts, RetriableCondition, RetryBodyLimit, RetryBudgetConfig, RetryPolicy,
+    RingHashOpts, SimpleStrategy, SubsetFallbackPolicy, SubsetOpts, UpstreamAuthority, UpstreamHttpVersion,
+    ZoneAwareOpts,
 };
 pub use condition::{
     ApplicationMatch, Condition, ConditionMatch, ResponseCondition, ResponseConditionMatch, SelectedUpstreamMatch,
 };
+pub use expanded_chains::ExpandedFilterChains;
 pub use filters::{FailureMode, FilterChainConfig, FilterEntry};
 pub use insecure_options::{InsecureFlag, InsecureOptions, SkipPipelineChecks};
 pub use listener::{Listener, ListenerTls, ProtocolKind};
@@ -56,6 +60,7 @@ pub use metrics::{MetricLabel, MetricLabelsConfig, MetricsConfig, RouteTemplates
 use parse::check_yaml_safety;
 pub use parse::read_config_file;
 pub use praxis_tls::{CachedClusterTls, ClusterTls};
+pub use redaction::{is_credential_header_name, redact_condition_headers, redact_response_condition_headers};
 pub use route::{PathMatch, Route};
 pub use runtime::{DEFAULT_SUBREQUEST_POOL_SIZE, RuntimeConfig};
 #[cfg(feature = "otel")]

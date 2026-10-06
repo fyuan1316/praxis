@@ -24,7 +24,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use praxis_core::{
     circuit::CircuitBreakerConfig,
-    config::{Config, DEFAULT_SUBREQUEST_POOL_SIZE},
+    config::{Config, DEFAULT_SUBREQUEST_POOL_SIZE, ExpandedFilterChains},
     subrequest::{SubRequestClient, SubRequestConnector, SubRequestConnectorOptions},
 };
 use praxis_filter::{FilterPipeline, FilterRegistry};
@@ -150,8 +150,9 @@ pub fn resolve_pipelines(
 /// hooks run again on every hot reload, so downstream extensions are never lost
 /// across a reload.
 ///
-/// Registers `subrequest_client`'s connector for the policy engine first, since
-/// a policy filter fetches JWKS while it is being constructed.
+/// Filters are built from a copy of `registry` that hands
+/// `subrequest_client`'s connector to policy filters, since a policy filter
+/// fetches JWKS while it is being constructed.
 ///
 /// # Errors
 ///
@@ -177,28 +178,12 @@ pub(crate) fn resolve_pipelines_with_composition(
     subrequest_client: &SubRequestClient,
     composition: &PipelineComposition,
 ) -> Result<ListenerPipelines, Box<dyn std::error::Error + Send + Sync>> {
-    // Before any pipeline is built: a policy filter fetches JWKS while it is
-    // being constructed below. This sits here rather than in the wrapper so
-    // the composition path registers too. Unconditional: the setter is a no-op
-    // without `policy-engine`, and gating it on this crate's own feature missed
-    // builds where a dependency turned the filter on through feature
-    // unification.
-    praxis_filter::set_policy_subrequest_connector(subrequest_client.connector());
-    let chains: HashMap<&str, &[_]> = config
-        .filter_chains
-        .iter()
-        .map(|chain| (chain.name.as_str(), chain.filters.as_slice()))
-        .collect();
+    let registry = runtime_registry(registry, subrequest_client);
+    let expanded_chains = ExpandedFilterChains::new(&config.filter_chains);
+    let chains = expanded_chains.as_slices();
     let mut pipelines = HashMap::with_capacity(config.listeners.len());
     for listener in &config.listeners {
-        let mut entries = Vec::new();
-        for chain_name in &listener.filter_chains {
-            let chain_filters = chains.get(chain_name.as_str()).ok_or_else(|| {
-                let lname = &listener.name;
-                format!("unknown chain '{chain_name}' for listener '{lname}'")
-            })?;
-            entries.extend_from_slice(chain_filters);
-        }
+        let mut entries = expanded_chains.for_listener(listener)?;
 
         validate_terminal_position(&entries, &listener.name)?;
 
@@ -210,7 +195,7 @@ pub(crate) fn resolve_pipelines_with_composition(
         // appear absent.
         let entry_snapshot = entries.clone();
         let mut pipeline =
-            FilterPipeline::build_with_chains(&mut entries, registry, &chains, &config.insecure_options)?;
+            FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &config.insecure_options)?;
         configure_pipeline(
             &mut pipeline,
             config,
@@ -255,6 +240,22 @@ pub(crate) fn resolve_pipelines_with_composition(
         .map(|listener| (listener.name.clone(), listener.protocol))
         .collect();
     Ok(ListenerPipelines::with_protocols(pipelines, protocols))
+}
+
+/// Copy `registry` for one runtime, handing `subrequest_client`'s connector to
+/// the policy filters it builds.
+///
+/// A policy filter needs the connector while it is constructed, too early for
+/// [`FilterPipeline::set_subrequest_client`]. The copy keeps runtimes that
+/// share a registry from picking up each other's connector. Unconditional:
+/// gating it on this crate's `policy-engine` feature would miss builds where
+/// a dependency turned the filter on through feature unification.
+///
+/// [`FilterPipeline::set_subrequest_client`]: praxis_filter::FilterPipeline::set_subrequest_client
+fn runtime_registry(registry: &FilterRegistry, subrequest_client: &SubRequestClient) -> FilterRegistry {
+    let mut runtime = registry.clone();
+    runtime.set_policy_connector(subrequest_client.connector());
+    runtime
 }
 
 /// Apply body limits, health registry, KV stores, pipeline extensions,
@@ -560,6 +561,166 @@ filter_chains:
         .unwrap();
         let pipeline = pipelines.get("web").unwrap().load();
         assert_eq!(pipeline.len(), 3, "two chains should produce 3 filters total");
+    }
+
+    #[test]
+    fn resolve_pipelines_inherits_chain_conditions() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use praxis_core::config::{Condition, FilterEntry};
+
+        /// Request-condition `path_prefix` values on one flattened entry, in order.
+        fn entry_prefixes(entry: &FilterEntry) -> Vec<Option<String>> {
+            entry
+                .conditions
+                .iter()
+                .map(|condition| match condition {
+                    Condition::When(matcher) => matcher.path_prefix.clone(),
+                    Condition::Unless(_) => None,
+                })
+                .collect()
+        }
+
+        let config = Config::from_yaml(
+            r#"
+listeners:
+  - name: web
+    address: "127.0.0.1:8080"
+    filter_chains: [guarded]
+filter_chains:
+  - name: guarded
+    conditions:
+      - when:
+          path_prefix: "/api"
+    filters:
+      - filter: request_id
+      - filter: headers
+        request_add:
+          - name: "x-tag"
+            value: "on"
+        conditions:
+          - when:
+              path_prefix: "/api/v2"
+"#,
+        )
+        .unwrap();
+        let registry = FilterRegistry::with_builtins();
+
+        let ran = Arc::new(AtomicUsize::new(0));
+        let ran_in_validator = Arc::clone(&ran);
+        let (_registry_factory, composition) = ServerComposition::standard()
+            .add_pipeline_validator(move |ctx| {
+                let entries = ctx.entries();
+                assert_eq!(entries.len(), 2, "two filters expanded from the chain");
+                assert_eq!(
+                    entry_prefixes(&entries[0]),
+                    vec![Some("/api".to_owned())],
+                    "the first filter inherits only the chain condition"
+                );
+                assert_eq!(
+                    entry_prefixes(&entries[1]),
+                    vec![Some("/api".to_owned()), Some("/api/v2".to_owned())],
+                    "the second filter inherits the chain condition first, then its own"
+                );
+                ran_in_validator.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .into_parts();
+
+        resolve_pipelines_with_composition(
+            &config,
+            &registry,
+            &empty_health_registry(),
+            &empty_kv_stores(),
+            &empty_session_stores(),
+            &empty_subrequest_client(),
+            &composition,
+        )
+        .unwrap();
+
+        assert_eq!(ran.load(Ordering::SeqCst), 1, "the pipeline validator must run once");
+    }
+
+    #[test]
+    fn resolve_pipelines_rejects_conditional_security_from_chain() {
+        let config = Config::from_yaml(
+            r#"
+listeners:
+  - name: web
+    address: "127.0.0.1:8080"
+    filter_chains: [guarded]
+filter_chains:
+  - name: guarded
+    conditions:
+      - when:
+          path_prefix: "/api"
+    filters:
+      - filter: ip_acl
+        allow: ["10.0.0.0/8"]
+"#,
+        )
+        .unwrap();
+        let result = resolve_pipelines(
+            &config,
+            &FilterRegistry::with_builtins(),
+            &empty_health_registry(),
+            &empty_kv_stores(),
+            &empty_session_stores(),
+            &empty_subrequest_client(),
+        );
+        let err = result.err().unwrap().to_string();
+        assert!(
+            err.contains("security filter 'ip_acl'") && err.contains("request conditions"),
+            "inherited conditions must trigger the conditional-security check: {err}"
+        );
+    }
+
+    #[cfg(feature = "upstream-binding")]
+    #[test]
+    fn resolve_pipelines_rejects_chain_bound_gate_before_binding_router() {
+        let config = Config::from_yaml(
+            r#"
+listeners:
+  - name: web
+    address: "127.0.0.1:8080"
+    filter_chains: [early, routing]
+filter_chains:
+  - name: early
+    conditions:
+      - when:
+          bound_upstream:
+            application_provider: openai
+    filters:
+      - filter: request_id
+  - name: routing
+    filters:
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: backend
+      - filter: load_balancer
+        clusters:
+          - name: backend
+            http:
+              application_provider: openai
+            endpoints: ["10.0.0.1:80"]
+"#,
+        )
+        .unwrap();
+        let result = resolve_pipelines(
+            &config,
+            &FilterRegistry::with_builtins(),
+            &empty_health_registry(),
+            &empty_kv_stores(),
+            &empty_session_stores(),
+            &empty_subrequest_client(),
+        );
+        let err = result.err().unwrap().to_string();
+        assert!(
+            err.contains("filter 'request_id' requires a bound logical upstream")
+                && err.contains("no preceding filter is guaranteed to bind one"),
+            "inherited bound_upstream gates must trigger the binding-order check: {err}"
+        );
     }
 
     #[test]
@@ -1191,6 +1352,35 @@ filter_chains:
             REQUEST_CONDITION | RESPONSE_CONDITION | BRANCH_CHAIN,
             "the validator must see request conditions, response conditions, and branch chains \
              on the flattened entries, not the husks left by build_with_chains"
+        );
+    }
+
+    #[test]
+    fn each_runtime_hands_its_own_connector_to_policy_filters() {
+        let shared = FilterRegistry::with_builtins();
+        let client_a = empty_subrequest_client();
+        let client_b = empty_subrequest_client();
+
+        let registry_a = runtime_registry(&shared, &client_a);
+        let registry_b = runtime_registry(&shared, &client_b);
+
+        let held_a = registry_a
+            .policy_connector()
+            .expect("runtime A's connector must be handed to its policy filters");
+        let held_b = registry_b
+            .policy_connector()
+            .expect("runtime B's connector must be handed to its policy filters");
+        assert!(
+            std::ptr::eq(held_a.connector(), client_a.connector().connector()),
+            "runtime A's policy filters must share runtime A's pool"
+        );
+        assert!(
+            std::ptr::eq(held_b.connector(), client_b.connector().connector()),
+            "runtime B's policy filters must share runtime B's pool"
+        );
+        assert!(
+            shared.policy_connector().is_none(),
+            "the caller's registry must not pick up either runtime's connector"
         );
     }
 

@@ -19,7 +19,8 @@ use ppe::praxis_policy_core::{
         CmfHook, Message, MessagePayload, Role,
         constants::{
             ENTITY_HTTP, ENTITY_LLM, ENTITY_NAME_GLOBAL, HOOK_CMF_LLM_INPUT, HOOK_CMF_LLM_OUTPUT,
-            HOOK_CMF_PROMPT_PRE_INVOKE, HOOK_CMF_RESOURCE_PRE_FETCH, HOOK_CMF_TOOL_PRE_INVOKE,
+            HOOK_CMF_PROMPT_POST_INVOKE, HOOK_CMF_PROMPT_PRE_INVOKE, HOOK_CMF_RESOURCE_POST_FETCH,
+            HOOK_CMF_RESOURCE_PRE_FETCH, HOOK_CMF_TOOL_POST_INVOKE, HOOK_CMF_TOOL_PRE_INVOKE,
         },
     },
     engine::PolicyEngine,
@@ -29,16 +30,15 @@ use ppe::praxis_policy_core::{
     http_hook::{HOOK_HTTP_REQUEST, HOOK_HTTP_RESPONSE, HttpHook, HttpPayload},
     identity::{HOOK_IDENTITY_RESOLVE, IdentityHook, IdentityPayload, TokenSource},
 };
+use praxis_core::subrequest::SubRequestConnector;
 
 use super::{
     assertions::{
         GovernedNames, apply_request_assertions, apply_response_assertions, snapshot_response_headers,
         unreachable_response_levels,
     },
-    common_message_format::{
-        entity_for_protocol_method, entity_for_protocol_method_post, llm_entity_post, llm_entity_pre,
-    },
-    config::{BodyAccessMode, PolicyFilterConfig, validate_trusted_private_endpoints},
+    common_message_format::{entity_for_protocol_method, entity_for_protocol_method_post},
+    config::{BodyAccessMode, PolicyFilterConfig},
     dispatch::{block_on_bounded, ensure_dispatch_runtime, response_dispatch_timeout},
     error::{
         VIOLATION_HEADER, auth_rejection, deny_with_body, json_rpc_error_envelope_bytes, json_rpc_error_rejection,
@@ -49,6 +49,7 @@ use super::{
         reserialize_json_rpc_response_body,
     },
     llm::{ParsedLlmRequest, ParsedLlmResponse, request_message, response_message},
+    transport::PolicyHttpTransport,
 };
 use crate::{
     AuthenticatedIdentity, FilterAction, FilterError, Rejection,
@@ -124,6 +125,18 @@ enum GatedIdentity {
 /// the upstream request body and the downstream response. It also enables
 /// `cmf.llm_output` for non-streaming inference responses. APL field
 /// mutators do not rewrite inference bodies.
+///
+/// `body_access: read_write` also enables response-phase `tool:` rules,
+/// including attribute-only `post_invocation` rules. Under `read_only`, these
+/// rules are skipped and a warning is emitted. A response-only route adds no
+/// request-phase route rule; identity checks and `global` policy still apply.
+///
+/// `prompt:` and `resource:` response rules do not currently run under either
+/// body access mode. Use `pre_invocation` for those controls.
+///
+/// Policies with MCP entity routes cannot declare `authorization:` on an
+/// `http:` route. Use `global` for shared authorization; route-scoped
+/// `authentication:` remains supported.
 ///
 /// Response-body hooks run on a small dedicated runtime while the worker
 /// waits, for at most twice the engine's per-plugin timeout
@@ -207,6 +220,10 @@ pub struct PolicyFilter {
     /// Bound on one response-phase hook dispatch, derived from the engine's
     /// per-plugin timeout.
     response_dispatch_timeout: std::time::Duration,
+    /// The transport installed on the engine, kept so tests can see which
+    /// connector policy calls go through.
+    #[cfg(test)]
+    transport: Arc<PolicyHttpTransport>,
 }
 
 impl PolicyFilter {
@@ -215,6 +232,10 @@ impl PolicyFilter {
     /// factories, wires the APL visitor, and initializes the manager.
     /// Errors abort filter chain construction at server startup —
     /// failing fast is what we want for misconfigured policy.
+    ///
+    /// Policy calls, including the JWKS fetches made while initializing, go
+    /// through `subrequest_connector`, or through a pool of their own without
+    /// one.
     ///
     /// # Errors
     ///
@@ -225,7 +246,10 @@ impl PolicyFilter {
         clippy::too_many_lines,
         reason = "linear construction + init steps; splitting obscures the startup flow"
     )]
-    pub(crate) fn new(cfg: PolicyFilterConfig) -> Result<Self, FilterError> {
+    pub(crate) fn new(
+        cfg: PolicyFilterConfig,
+        subrequest_connector: Option<SubRequestConnector>,
+    ) -> Result<Self, FilterError> {
         // Bound the per-request ReadWrite buffer ceiling: 0 makes every
         // non-empty body fail, and an unbounded value multiplies per-request
         // memory by concurrency. The pipeline's unbounded-buffer startup check
@@ -256,7 +280,7 @@ impl PolicyFilter {
 
         // Reject a malformed pinned-endpoint entry at startup rather than let it
         // silently never match at request time.
-        validate_trusted_private_endpoints(&cfg.trusted_private_endpoints)?;
+        praxis_core::connectivity::validate_host_entries("policy", &cfg.trusted_private_endpoints)?;
 
         let yaml = std::fs::read_to_string(&cfg.config_path).map_err(|e| -> FilterError {
             format!("policy: failed to read config_path {}: {e}", cfg.config_path).into()
@@ -266,7 +290,12 @@ impl PolicyFilter {
         ppe::install_builtins(&mgr);
 
         // The lazy connection pool must not bind to the temporary init runtime.
-        if !Self::install_http_transport(&mgr, cfg.allow_private_idp, &cfg.trusted_private_endpoints) {
+        let transport = Self::http_transport(
+            subrequest_connector,
+            cfg.allow_private_idp,
+            &cfg.trusted_private_endpoints,
+        );
+        if !mgr.set_http_transport(Arc::<PolicyHttpTransport>::clone(&transport)) {
             // Set-once, and this manager was just constructed, so a refusal
             // means the engine changed under us rather than a double install.
             tracing::warn!(
@@ -350,9 +379,25 @@ impl PolicyFilter {
         // needs no operator-set mode. `has_hooks_for` reports whether a hook
         // was wired by the policy (registered handler or route annotation).
         let http_global = mgr.has_hooks_for(HOOK_HTTP_REQUEST);
-        let mcp_routes = mgr.has_hooks_for(HOOK_CMF_TOOL_PRE_INVOKE)
+        // The engine installs a route's pre and post halves independently, so a
+        // route whose only declarations are `result.<field>` pipelines or
+        // `post_invocation` steps registers the post hook and no pre hook. Both
+        // halves count toward `mcp_routes`: the response phase dispatches off
+        // `entity_routes`, so a post-only policy needs it true.
+        let mcp_pre = mgr.has_hooks_for(HOOK_CMF_TOOL_PRE_INVOKE)
             || mgr.has_hooks_for(HOOK_CMF_PROMPT_PRE_INVOKE)
             || mgr.has_hooks_for(HOOK_CMF_RESOURCE_PRE_FETCH);
+        // Split by entity because only the tool half is dispatched. The
+        // response phase builds its payload with
+        // `build_response_content_for_method`, which projects `tools/call` and
+        // nothing else, so a prompt or resource post hook is registered,
+        // reached, and then skipped on empty content. The two get different
+        // advice below.
+        let mcp_post_tool = mgr.has_hooks_for(HOOK_CMF_TOOL_POST_INVOKE);
+        let mcp_post_undispatched =
+            mgr.has_hooks_for(HOOK_CMF_PROMPT_POST_INVOKE) || mgr.has_hooks_for(HOOK_CMF_RESOURCE_POST_FETCH);
+        let mcp_post = mcp_post_tool || mcp_post_undispatched;
+        let mcp_routes = mcp_pre || mcp_post;
         let llm_post = mgr.has_hooks_for(HOOK_CMF_LLM_OUTPUT);
         // A post-only route still needs request state for response dispatch.
         let llm_routes = mgr.has_hooks_for(HOOK_CMF_LLM_INPUT) || llm_post;
@@ -399,6 +444,12 @@ impl PolicyFilter {
             Self::warn_on_inference_gaps(&policy_config, http_global, &cfg, llm_post);
         }
         Self::warn_on_inert_inference_defaults(&policy_config, llm_routes);
+        Self::warn_on_entity_response_gaps(&cfg, mcp_post_tool, mcp_post_undispatched);
+
+        // Reject an `http:` route that no classified request can reach.
+        if let Some(message) = Self::http_route_beside_entity_routes(&yaml, mcp_routes) {
+            return Err(message.into());
+        }
 
         // Reject controls that cannot reach the writable response-header phase.
         let unreachable = unreachable_response_levels(&policy_config);
@@ -433,7 +484,15 @@ impl PolicyFilter {
             llm_request_mutator_warned: AtomicBool::new(false),
             llm_response_mutator_warned: AtomicBool::new(false),
             response_dispatch_timeout: dispatch_timeout,
+            #[cfg(test)]
+            transport,
         })
+    }
+
+    /// Test accessor for the transport installed on the engine.
+    #[cfg(test)]
+    pub(super) fn transport(&self) -> &PolicyHttpTransport {
+        &self.transport
     }
 
     /// Test accessor for the hook the response half dispatches, if any.
@@ -510,6 +569,63 @@ impl PolicyFilter {
         );
     }
 
+    /// Warn when configured MCP entity response rules cannot run.
+    fn warn_on_entity_response_gaps(cfg: &PolicyFilterConfig, post_tool: bool, post_undispatched: bool) {
+        if post_tool && !matches!(cfg.body_access, BodyAccessMode::ReadWrite) {
+            tracing::warn!(
+                target: "policy.filter",
+                "policy declares response-phase `tool:` rules (`result.<field>` or \
+                 `post_invocation`) but `body_access` is `read_only`, which does not buffer the \
+                 response: those rules will never run. Set `body_access: read_write` to enable \
+                 them.",
+            );
+        }
+        if post_undispatched {
+            tracing::warn!(
+                target: "policy.filter",
+                "policy declares response-phase `prompt:` or `resource:` rules \
+                 (`result.<field>` or `post_invocation`): those rules never run. The response \
+                 payload is projected for `tools/call` only, so the hook is registered and then \
+                 skipped. `body_access: read_write` does not change this. Move the control to the \
+                 request phase (`pre_invocation`), which is dispatched for all three entity types.",
+            );
+        }
+    }
+
+    /// Return a load error for an `http:` authorization route alongside MCP
+    /// entity routes, or `None` when no such route exists.
+    pub(super) fn http_route_beside_entity_routes(yaml: &str, mcp_routes: bool) -> Option<String> {
+        if !mcp_routes {
+            return None;
+        }
+        // RouteEntry omits authorization steps, so inspect the raw YAML and
+        // reject a parse failure rather than skip this check.
+        let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(yaml) else {
+            return Some(
+                "policy: praxis could not re-read the policy document to check the `http:` route \
+                 contract. Refusing to load, because an `http:` route whose `authorization:` \
+                 never runs cannot be ruled out."
+                    .to_owned(),
+            );
+        };
+        let routes = doc.get("routes").and_then(serde_yaml::Value::as_sequence)?;
+        let offenders = routes
+            .iter()
+            .filter(|route| route.get("http").is_some() && route.get("authorization").is_some())
+            .count();
+        if offenders == 0 {
+            return None;
+        }
+        Some(format!(
+            "policy: {offenders} `http:` route(s) declare `authorization:` alongside MCP entity \
+             routes. A classified MCP request is evaluated against its entity route, so those \
+             steps never run for a tool, prompt, or resource call and the route would gate \
+             nothing. Move cross-cutting rules into the `global` block, which is layered into \
+             every entity route, or front non-MCP traffic with a separate listener/filter. A \
+             route-scoped `authentication:` list is unaffected and may stay."
+        ))
+    }
+
     /// Warn when inference defaults have no route to apply them.
     fn warn_on_inert_inference_defaults(
         policy_config: &ppe::praxis_policy_core::config::PolicyConfig,
@@ -543,17 +659,37 @@ impl PolicyFilter {
         }
     }
 
-    /// Praxis-side factory hook, wired via `register_http` in
-    /// `filter/src/registry.rs`.
+    /// Build a filter from its YAML config without the runtime's sub-request
+    /// connector, so its policy calls open a connection pool of their own.
+    ///
+    /// A [`FilterRegistry`] builds `policy` filters with the connector handed
+    /// to [`FilterRegistry::set_policy_connector`] instead.
     ///
     /// # Errors
     ///
     /// Returns [`FilterError`] if the config block fails to parse
     /// as a `PolicyFilterConfig` or filter construction fails.
+    ///
+    /// [`FilterRegistry`]: crate::FilterRegistry
+    /// [`FilterRegistry::set_policy_connector`]: crate::FilterRegistry::set_policy_connector
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: PolicyFilterConfig = parse_filter_config("policy", config)?;
-        let filter = Self::new(cfg)?;
-        Ok(Box::new(filter))
+        Ok(Box::new(Self::new(cfg, None)?))
+    }
+
+    /// Build a filter from its YAML config whose policy calls go through
+    /// `subrequest_connector`, or through a pool of their own without one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FilterError`] if the config block fails to parse
+    /// as a `PolicyFilterConfig` or filter construction fails.
+    pub(crate) fn from_config_with_connector(
+        config: &serde_yaml::Value,
+        subrequest_connector: Option<SubRequestConnector>,
+    ) -> Result<Self, FilterError> {
+        let cfg: PolicyFilterConfig = parse_filter_config("policy", config)?;
+        Self::new(cfg, subrequest_connector)
     }
 
     /// Snapshot the request's HTTP headers into a case-normalized
@@ -682,12 +818,12 @@ impl PolicyFilter {
         Self::publish_identity_projection(ctx, Self::authenticated_identity(identity));
     }
 
-    /// Install the proxy-backed transport with the configured destination policy.
-    fn install_http_transport(
-        mgr: &Arc<PolicyEngine>,
+    /// Build the proxy-backed transport with the configured destination policy.
+    fn http_transport(
+        subrequest_connector: Option<SubRequestConnector>,
         allow_private: bool,
         trusted_private_endpoints: &[String],
-    ) -> bool {
+    ) -> Arc<PolicyHttpTransport> {
         if allow_private {
             tracing::info!(
                 target: "policy.filter",
@@ -707,10 +843,11 @@ impl PolicyFilter {
                 "policy: permitting private addresses for pinned policy endpoints"
             );
         }
-        mgr.set_http_transport(Arc::new(super::transport::PolicyHttpTransport::new(
+        Arc::new(PolicyHttpTransport::with_connector(
+            subrequest_connector,
             allow_private,
             allowlist,
-        )))
+        ))
     }
 
     /// Build the public string-valued identity projection from a validated payload.
@@ -877,7 +1014,7 @@ impl PolicyFilter {
         parsed: &ParsedLlmRequest,
         model: String,
     ) -> Result<FilterAction, FilterError> {
-        let (entity_type, hook_name) = llm_entity_pre();
+        let (entity_type, hook_name) = (ENTITY_LLM, HOOK_CMF_LLM_INPUT);
 
         // Reject before identity because an unmatched model has no policy to run.
         if self.cfg.llm.require_route && !self.llm_route_selects(&model) {
@@ -1046,7 +1183,7 @@ impl PolicyFilter {
             return Ok(FilterAction::Continue);
         }
 
-        let (entity_type, hook_name) = llm_entity_post();
+        let (entity_type, hook_name) = (ENTITY_LLM, HOOK_CMF_LLM_OUTPUT);
         let headers = Self::snapshot_headers(ctx);
         let Some(ResolvedIdentity(identity)) = ctx.extensions.get::<ResolvedIdentity>() else {
             // Missing request identity would otherwise skip response policy.

@@ -23,6 +23,25 @@ use crate::{
     context::PendingStreamChunks, extensions::RequestExtensions,
 };
 
+/// Present only while a cancelled streaming sub-request runs its completion
+/// body hooks. Their output is discarded, but earlier chunks or response
+/// headers may already have been delivered. Filters that remember stream
+/// delivery must ignore this synthetic completion pass while preserving any
+/// delivery evidence recorded before suppression.
+#[derive(Clone, Copy, Debug)]
+pub struct StreamBodySuppressed;
+
+/// The streaming callout's response exceeded its configured byte ceiling.
+///
+/// Callers can downcast a [`FilterError`] to this type to distinguish a body
+/// limit from an upstream stream failure.
+#[derive(Debug, thiserror::Error)]
+#[error("filtered_subrequest: streaming response exceeds configured body limit ({limit} bytes)")]
+pub struct CalloutResponseTooLarge {
+    /// Configured cumulative response byte ceiling.
+    pub limit: usize,
+}
+
 /// Streaming body implementation for a filtered sub-request's response.
 pub(crate) struct FilteredStreamingBody {
     /// Upstream streaming body handle. `None` after cancellation.
@@ -35,6 +54,8 @@ pub(crate) struct FilteredStreamingBody {
     deferred_completion_output: Option<Bytes>,
     /// Per-callback local output waiting to be pulled downstream.
     pending_chunks: VecDeque<Bytes>,
+    /// Transport byte ceiling that ended this stream, when it overflowed.
+    transport_overflow_limit: Option<usize>,
 }
 
 impl FilteredStreamingBody {
@@ -46,6 +67,7 @@ impl FilteredStreamingBody {
             finished: false,
             deferred_completion_output: None,
             pending_chunks: VecDeque::new(),
+            transport_overflow_limit: None,
         }
     }
 
@@ -68,6 +90,7 @@ impl FilteredStreamingBody {
     #[expect(clippy::too_many_lines, reason = "context reconstruction requires many fields")]
     fn run_step_body_filters(&mut self, body: &mut Option<Bytes>, end_of_stream: bool) -> Result<(), FilterError> {
         let remaining_read_timeout;
+        let stream_deadline;
         let result = {
             let cont = &mut self.continuation;
             let mut ctx = crate::filter::HttpFilterContext {
@@ -129,6 +152,7 @@ impl FilteredStreamingBody {
             );
 
             remaining_read_timeout = leftover_stream_read_timeout(&mut ctx);
+            stream_deadline = leftover_stream_deadline(&mut ctx);
 
             cont.body_done_indices = ctx.body_done_indices;
             cont.executed_filter_indices = ctx.executed_filter_indices;
@@ -148,6 +172,7 @@ impl FilteredStreamingBody {
                 .into());
         }
         apply_leftover_read_timeout(&mut self.upstream, remaining_read_timeout);
+        apply_leftover_stream_deadline(&mut self.upstream, stream_deadline);
         Ok(())
     }
 
@@ -214,6 +239,9 @@ impl FilteredStreamingBody {
         &mut self,
         e: praxis_core::subrequest::SubRequestError,
     ) -> Result<Option<Bytes>, FilterError> {
+        if let praxis_core::subrequest::SubRequestError::ResponseTooLarge { limit, .. } = &e {
+            self.transport_overflow_limit = Some(*limit);
+        }
         if let Some(upstream_body) = self.upstream.take() {
             (*upstream_body).cancel().await;
         }
@@ -287,7 +315,10 @@ impl StreamingResponseBody for FilteredStreamingBody {
             if let Some(upstream_body) = self.upstream.take() {
                 (*upstream_body).cancel().await;
             }
-            self.complete_step()?;
+            self.continuation.extensions.insert(StreamBodySuppressed);
+            let completion = self.complete_step();
+            let _ = self.continuation.extensions.remove::<StreamBodySuppressed>();
+            completion?;
         }
         Ok(())
     }
@@ -322,6 +353,29 @@ fn apply_leftover_read_timeout(body: &mut Option<Box<SubResponseBody>>, leftover
         && let Some(upstream) = body.as_mut()
     {
         upstream.cap_read_timeout(timeout);
+    }
+}
+
+/// Take the absolute stream deadline requested by the current body-filter pass.
+fn leftover_stream_deadline(ctx: &mut crate::filter::HttpFilterContext<'_>) -> Option<std::time::Instant> {
+    ctx.take_stream_deadline_cap()
+}
+
+/// Convert the filter context's standard monotonic instant to Tokio's instant
+/// without sampling either clock.
+///
+/// Tokio's direct conversion preserves the supplied absolute cutoff, including
+/// when Tokio's clock is paused in a test.
+fn std_instant_to_tokio(deadline: std::time::Instant) -> tokio::time::Instant {
+    tokio::time::Instant::from_std(deadline)
+}
+
+/// Apply an absolute stream deadline to the live response body.
+fn apply_leftover_stream_deadline(body: &mut Option<Box<SubResponseBody>>, deadline: Option<std::time::Instant>) {
+    if let Some(deadline) = deadline
+        && let Some(upstream) = body.as_mut()
+    {
+        upstream.cap_stream_deadline(std_instant_to_tokio(deadline));
     }
 }
 
@@ -402,11 +456,15 @@ impl CalloutStreamingBody {
         let total = self
             .emitted_bytes
             .checked_add(chunk.len())
-            .ok_or_else(|| -> FilterError { "filtered_subrequest: stream byte count overflow".into() })?;
+            .ok_or_else(|| -> FilterError {
+                Box::new(CalloutResponseTooLarge {
+                    limit: self.max_response_bytes,
+                })
+            })?;
         if total > self.max_response_bytes {
-            return Err("filtered_subrequest: streaming response exceeds configured body limit"
-                .to_owned()
-                .into());
+            return Err(Box::new(CalloutResponseTooLarge {
+                limit: self.max_response_bytes,
+            }));
         }
         self.emitted_bytes = total;
         Ok(Some(chunk))
@@ -415,6 +473,7 @@ impl CalloutStreamingBody {
     /// Consume the inner body at EOF, queueing completion output or recording an
     /// unhandled termination to surface after buffered chunks drain.
     fn drain_completion(&mut self) -> Result<(), FilterError> {
+        let transport_overflow_limit = self.inner.as_ref().and_then(|inner| inner.transport_overflow_limit);
         let (continuation, completion_output) = self
             .inner
             .take()
@@ -424,8 +483,12 @@ impl CalloutStreamingBody {
         self.held_extensions = Some(completion.extensions);
         if let Some(termination) = completion.termination.as_ref().filter(|t| !t.is_handled()) {
             let cause = termination.cause();
-            self.deferred_error =
-                Some(format!("filtered_subrequest: unhandled upstream stream termination: {cause:?}").into());
+            self.deferred_error = Some(match transport_overflow_limit {
+                Some(limit) if cause == StreamTerminationCause::ResponseTooLarge => {
+                    Box::new(CalloutResponseTooLarge { limit })
+                },
+                _ => format!("filtered_subrequest: unhandled upstream stream termination: {cause:?}").into(),
+            });
             return Ok(());
         }
         self.pending.extend(completion.pending_chunks);
@@ -495,5 +558,224 @@ impl StreamingResponseBody for CalloutStreamingBody {
         } else if let Some(held) = self.held_extensions.as_mut() {
             std::mem::swap(held, extensions);
         }
+    }
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    clippy::too_many_lines,
+    clippy::unwrap_used,
+    reason = "streaming deadline integration setup"
+)]
+mod tests {
+    use std::{
+        collections::{HashMap, VecDeque},
+        sync::Arc,
+        time::{Duration, Instant},
+    };
+
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use http::HeaderMap;
+    use praxis_core::subrequest::{StreamLimits, SubRequest, SubRequestClient, SubRequestError};
+
+    use super::{CalloutResponseTooLarge, CalloutStreamingBody, FilteredStreamingBody, std_instant_to_tokio};
+
+    #[test]
+    fn streaming_callout_limit_error_is_typed_and_terminal() {
+        let mut body = CalloutStreamingBody {
+            inner: None,
+            pending: VecDeque::new(),
+            held_extensions: None,
+            deferred_error: None,
+            emitted_bytes: 0,
+            max_response_bytes: 4,
+            finished: false,
+        };
+
+        body.checked(Bytes::from_static(b"1234"))
+            .expect("the first four bytes fit the ceiling");
+        let error = body
+            .checked(Bytes::from_static(b"5"))
+            .expect_err("the fifth byte exceeds the ceiling");
+        assert_eq!(
+            error.downcast_ref::<CalloutResponseTooLarge>().map(|e| e.limit),
+            Some(4)
+        );
+        assert!(body.finished, "the rejected chunk must terminate the stream");
+        drop(body);
+    }
+
+    struct ExpiredDeadlineFilter;
+
+    #[async_trait]
+    impl crate::HttpFilter for ExpiredDeadlineFilter {
+        fn name(&self) -> &'static str {
+            "expired_deadline_test_filter"
+        }
+
+        async fn on_request(
+            &self,
+            _ctx: &mut crate::HttpFilterContext<'_>,
+        ) -> Result<crate::FilterAction, crate::FilterError> {
+            Ok(crate::FilterAction::Continue)
+        }
+
+        fn response_body_access(&self) -> crate::BodyAccess {
+            crate::BodyAccess::ReadOnly
+        }
+
+        fn on_response_body(
+            &self,
+            ctx: &mut crate::HttpFilterContext<'_>,
+            _body: &mut Option<Bytes>,
+            _end_of_stream: bool,
+        ) -> Result<crate::FilterAction, crate::FilterError> {
+            ctx.cap_stream_deadline(Instant::now() - Duration::from_secs(1));
+            Ok(crate::FilterAction::Continue)
+        }
+    }
+
+    async fn spawn_stalling_backend() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        use tokio::io::AsyncWriteExt as _;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            drop(tokio::io::AsyncReadExt::read(&mut socket, &mut request).await);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n")
+                .await
+                .unwrap();
+            socket.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        (addr, handle)
+    }
+
+    #[tokio::test]
+    async fn body_filter_deadline_is_applied_to_live_body() {
+        use pingora_core::upstreams::peer::HttpPeer;
+
+        let (addr, backend) = spawn_stalling_backend().await;
+        praxis_tls::provider::install();
+        let connector = praxis_core::subrequest::SubRequestConnector::new(1, None);
+        let client = SubRequestClient::new(connector);
+        let peer = HttpPeer::new(addr.to_string(), false, String::new());
+        let request = SubRequest {
+            method: http::Method::GET,
+            uri: http::Uri::from_static("/deadline-wire"),
+            headers: HeaderMap::new(),
+            body: Bytes::new(),
+        };
+        let response = Box::pin(client.send_streaming(
+            &peer,
+            &request,
+            Duration::from_secs(5),
+            StreamLimits {
+                idle_timeout: Duration::from_secs(30),
+                max_stream_duration: None,
+                max_total_bytes: None,
+            },
+            None,
+        ))
+        .await
+        .unwrap();
+
+        let mut registry = crate::FilterRegistry::with_builtins();
+        registry
+            .register(
+                "expired_deadline_test_filter",
+                crate::FilterFactory::Http(Arc::new(|_| Ok(Box::new(ExpiredDeadlineFilter)))),
+            )
+            .unwrap();
+        let mut entries = vec![praxis_core::config::FilterEntry {
+            branch_chains: None,
+            conditions: vec![],
+            filter_type: "expired_deadline_test_filter".into(),
+            config: serde_yaml::Value::Null,
+            name: None,
+            response_conditions: vec![],
+            failure_mode: praxis_core::config::FailureMode::default(),
+        }];
+        let pipeline = Arc::new(crate::FilterPipeline::build(&mut entries, &registry).unwrap());
+        let continuation = super::super::continuation::FilteredSubrequestContinuation {
+            pipeline,
+            request_snapshot: crate::Request {
+                headers: HeaderMap::new(),
+                method: http::Method::GET,
+                uri: http::Uri::from_static("/deadline-wire"),
+            },
+            response_snapshot: crate::Response {
+                headers: HeaderMap::new(),
+                status: http::StatusCode::OK,
+            },
+            extensions: crate::RequestExtensions::default(),
+            filter_state: HashMap::new(),
+            filter_results: HashMap::new(),
+            filter_metadata: HashMap::new(),
+            structured_metadata: HashMap::new(),
+            executed_filter_indices: vec![true],
+            body_done_indices: vec![false],
+            response_body_bytes: 0,
+            response_body_mode: crate::BodyMode::Stream,
+            completed: false,
+            client_addr: None,
+            downstream_tls: false,
+            request_start: Instant::now(),
+            step_deadline: Instant::now() + Duration::from_secs(30),
+            peer_identity: None,
+        };
+        let mut filtered = FilteredStreamingBody::new(Box::new(response.body), continuation);
+        let mut body = Some(Bytes::from_static(b"first chunk"));
+
+        filtered.run_step_body_filters(&mut body, false).unwrap();
+        let err = filtered
+            .upstream
+            .as_mut()
+            .expect("the live upstream body must remain attached")
+            .next_chunk()
+            .await
+            .unwrap_err();
+        drop(filtered);
+        backend.abort();
+
+        assert!(
+            matches!(err, SubRequestError::DeadlineExceeded),
+            "the body filter's expired absolute deadline must reach the live body: {err}"
+        );
+    }
+
+    #[test]
+    fn std_instant_to_tokio_preserves_a_future_deadline() {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let converted = std_instant_to_tokio(deadline);
+        assert!(
+            converted > tokio::time::Instant::now(),
+            "a future standard deadline must remain in the future after conversion"
+        );
+        assert_eq!(
+            converted.into_std(),
+            deadline,
+            "direct conversion must preserve the absolute deadline"
+        );
+    }
+
+    #[test]
+    fn std_instant_to_tokio_clamps_an_expired_deadline() {
+        let deadline = Instant::now() - Duration::from_secs(1);
+        let converted = std_instant_to_tokio(deadline);
+        assert!(
+            converted <= tokio::time::Instant::now(),
+            "an expired standard deadline must not become a future Tokio deadline"
+        );
+        assert_eq!(
+            converted.into_std(),
+            deadline,
+            "direct conversion must preserve an expired absolute deadline"
+        );
     }
 }
